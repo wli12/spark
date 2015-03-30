@@ -19,17 +19,24 @@ package org.apache.spark.ml.recommendation
 
 import java.{util => ju}
 
-import breeze.optimize.proximal.{ProximalL1, QuadraticMinimizer}
+
 import scala.collection.mutable
+import scala.math.sqrt
 import scala.reflect.ClassTag
 import scala.util.Sorting
 import scala.util.hashing.byteswap64
+
+import breeze.linalg.{DenseVector=>BrzVector, DenseMatrix=>BrzMatrix}
+import breeze.optimize.proximal.{ProximalL1, QuadraticMinimizer}
+import breeze.optimize.proximal.Constraint._
+import breeze.stats.regression.lasso
+
 
 import com.github.fommil.netlib.BLAS.{getInstance => blas}
 import com.github.fommil.netlib.LAPACK.{getInstance => lapack}
 import org.netlib.util.intW
 
-import org.apache.spark.{Logging, Partitioner}
+import org.apache.spark.{AccumulatorParam, HashPartitioner, Logging, Partitioner}
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.ml.{Estimator, Model}
 import org.apache.spark.ml.param._
@@ -42,9 +49,7 @@ import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.Utils
 import org.apache.spark.util.collection.{OpenHashMap, OpenHashSet, SortDataFormat, Sorter}
 import org.apache.spark.util.random.XORShiftRandom
-import breeze.optimize.proximal.Constraint._
-import breeze.linalg.{DenseVector=>BrzVector}
-import breeze.linalg.{DenseMatrix=>BrzMatrix}
+
 
 /**
  * Common params for ALS.
@@ -327,6 +332,25 @@ object ALS extends Logging {
     def solve(ne: NormalEquation, lambda: Double): Array[Float]
   }
 
+  /** Lasso solver for least square problems with Breeze. */
+  private[recommendation] class LassoSolver extends LeastSquaresNESolver {
+
+    /**
+     * Solves a least squares problem with L1 regularization:
+     *
+     *   min norm(A x - b)^2^ + lambda * n * norm(x)^1^
+     *
+     * @param ne a [[NormalEquation]] instance that contains AtA, Atb, and n (number of instances)
+     * @param lambda regularization constant, which will be scaled by n
+     * @return the solution x
+     */
+    override def solve(ne: NormalEquation, lambda: Double): Array[Float] = {
+      val scaledlambda = lambda * ne.n
+      val result = lasso(ne.data, ne.output, scaledlambda)
+      result.coefficients.toArray.map(_.toFloat)
+    }
+  }
+
   /** QuadraticMinimization solver for least square problems. */
   private[recommendation] class QuadraticSolver(rank: Int, constraint: Constraint) extends LeastSquaresNESolver {
     private val qm = QuadraticMinimizer(rank, constraint)
@@ -485,8 +509,17 @@ object ALS extends Logging {
     /** Number of observations. */
     var n = 0
 
+    var data = BrzMatrix.zeros[Double](1,1)
+    var output = BrzVector.zeros[Double](1)
+
     private val da = new Array[Double](k)
     private val upper = "U"
+
+    // For lasso solver
+    def init(numObservations : Int) = {
+      data = BrzMatrix.zeros[Double](numObservations,k)
+      output = BrzVector.zeros[Double](numObservations)
+    }
 
     private def copyToDouble(a: Array[Float]): Unit = {
       var i = 0
@@ -502,6 +535,8 @@ object ALS extends Logging {
       copyToDouble(a)
       blas.dspr(upper, k, 1.0, da, 1, ata)
       blas.daxpy(k, b.toDouble, da, 1, atb, 1)
+      data(n,::) := BrzVector(a.map(_.toDouble)).t
+      output(n) = b.toDouble
       n += 1
       this
     }
@@ -567,9 +602,15 @@ object ALS extends Logging {
     val userLocalIndexEncoder = new LocalIndexEncoder(userPart.numPartitions)
     val itemLocalIndexEncoder = new LocalIndexEncoder(itemPart.numPartitions)
     val solver = System.getenv("solver")
-
+    var userNorm = false
+    var itemNorm = false
     val userSolver =
       if (userConstraint == POSITIVE) new NNLSSolver
+      else if (userConstraint == LASSO) new LassoSolver
+      else if (userConstraint == NORM) {
+        userNorm = true
+        new CholeskySolver
+      }
       else {
         if (solver == "mllib") new CholeskySolver
         else {
@@ -580,6 +621,11 @@ object ALS extends Logging {
 
     val itemSolver =
       if (itemConstraint == POSITIVE) new NNLSSolver
+      else if (itemConstraint == LASSO) new LassoSolver
+      else if (itemConstraint == NORM) {
+        itemNorm = true
+        new CholeskySolver
+      }
       else {
         if (solver == "mllib") new CholeskySolver
         else {
@@ -623,9 +669,10 @@ object ALS extends Logging {
     } else {
       for (iter <- 0 until maxIter) {
         itemFactors = computeFactors(userFactors, userOutBlocks, itemInBlocks, rank, itemRegParam,
-          userLocalIndexEncoder, solver = itemSolver)
+          userLocalIndexEncoder, solver = itemSolver, useNorm = itemNorm)
         userFactors = computeFactors(itemFactors, itemOutBlocks, userInBlocks, rank, userRegParam,
-          itemLocalIndexEncoder, solver = userSolver)
+          itemLocalIndexEncoder, solver = userSolver, useNorm = userNorm)
+        println("[warn] =iter " + iter.toString +"=================")
       }
     }
     val userIdAndFactors = userInBlocks
@@ -1140,7 +1187,8 @@ object ALS extends Logging {
       srcEncoder: LocalIndexEncoder,
       implicitPrefs: Boolean = false,
       alpha: Double = 1.0,
-      solver: LeastSquaresNESolver): RDD[(Int, FactorBlock)] = {
+      solver: LeastSquaresNESolver,
+      useNorm: Boolean = false): RDD[(Int, FactorBlock)] = {
     val numSrcBlocks = srcFactorBlocks.partitions.length
     val YtY = if (implicitPrefs) Some(computeYtY(srcFactorBlocks, rank)) else None
     val srcOut = srcOutBlocks.join(srcFactorBlocks).flatMap {
@@ -1150,7 +1198,9 @@ object ALS extends Logging {
         }
     }
     val merged = srcOut.groupByKey(new ALSPartitioner(dstInBlocks.partitions.length))
-    dstInBlocks.join(merged).mapValues {
+    val sc = srcFactorBlocks.sparkContext
+    val normAccum = sc.accumulator(BrzVector.zeros[Double](rank))(VectorAccumulatorParam)
+    val dstFactorBlocks = dstInBlocks.join(merged).mapValues {
       case (InBlock(dstIds, srcPtrs, srcEncodedIndices, ratings), srcFactors) =>
         val sortedSrcFactors = new Array[FactorBlock](numSrcBlocks)
         var solveTime = 0.0
@@ -1159,13 +1209,14 @@ object ALS extends Logging {
         }
         val dstFactors = new Array[Array[Float]](dstIds.length)
         var j = 0
-        val ls = new NormalEquation(rank)
         while (j < dstIds.length) {
+          val ls = new NormalEquation(rank)
           ls.reset()
           if (implicitPrefs) {
             ls.merge(YtY.get)
           }
           var i = srcPtrs(j)
+          ls.init(srcPtrs(j + 1) - srcPtrs(j))
           while (i < srcPtrs(j + 1)) {
             val encoded = srcEncodedIndices(i)
             val blockId = srcEncoder.blockId(encoded)
@@ -1181,11 +1232,37 @@ object ALS extends Logging {
           }
           val startTime = System.nanoTime()
           dstFactors(j) = solver.solve(ls, regParam)
+	  if (useNorm) normAccum += new BrzVector(dstFactors(j).map(_.toDouble))
           solveTime += (System.nanoTime() - startTime)
           j += 1
         }
         logInfo(s"solveTime ${solveTime/1e6} ms")
         dstFactors
+    }
+    if (useNorm) {
+      val normValue = normAccum.value.map(x => sqrt(x))
+      dstFactorBlocks.mapValues {
+        _.map {
+          dstFactor =>
+            for (i <- 0 until dstFactor.length) {
+              if (normValue(i) > 1) {
+                dstFactor(i) = (dstFactor(i).toDouble / normValue(i)).toFloat
+              }
+            }
+            dstFactor
+        }
+      }
+    } else {
+      dstFactorBlocks
+    }
+  }
+
+  object VectorAccumulatorParam extends AccumulatorParam[BrzVector[Double]] {
+    def zero(initialValue: BrzVector[Double]): BrzVector[Double] = {
+      BrzVector.zeros[Double](initialValue.length)
+    }
+    def addInPlace(v1: BrzVector[Double], v2: BrzVector[Double]): BrzVector[Double] = {
+      v1 += v2
     }
   }
 
