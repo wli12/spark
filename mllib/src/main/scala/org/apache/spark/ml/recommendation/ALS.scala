@@ -29,7 +29,7 @@ import scala.util.hashing.byteswap64
 import breeze.linalg.{DenseVector=>BrzVector, DenseMatrix=>BrzMatrix}
 import breeze.optimize.proximal.{ProximalL1, QuadraticMinimizer}
 import breeze.optimize.proximal.Constraint._
-import breeze.stats.regression.lasso
+import breeze.stats.regression.{newLasso=>lasso}
 
 
 import com.github.fommil.netlib.BLAS.{getInstance => blas}
@@ -707,6 +707,38 @@ object ALS extends Logging {
       itemOutBlocks.unpersist()
       blockRatings.unpersist()
     }
+
+    println("===userIdAndFactors====================================")
+    val zeroNum = sc.accumulator(0)
+    val totalNum = sc.accumulator(0)
+    userIdAndFactors.foreach{ x =>
+      println(x._1)
+      x._2.foreach{
+        x2 =>
+          print(x2.toString + " ")
+          if(math.abs(x2) < 1e-7) zeroNum += 1
+          totalNum += 1
+      }
+    }
+    val userzerorate = zeroNum.value.toDouble/totalNum.value
+
+    zeroNum.setValue(0)
+    totalNum.setValue(0)
+    println("===itemIdAndFactors====================================")
+    itemIdAndFactors.foreach{ x =>
+      println(x._1)
+      x._2.foreach{
+        x2 =>
+          print(x2.toString + " ")
+          if(math.abs(x2) < 1e-7) zeroNum += 1
+          totalNum += 1
+      }
+    }
+    val itemzerorate = zeroNum.value.toDouble/totalNum.value
+    println()
+    println("userIdAndFactors zero rate:" + userzerorate)
+    println("itemIdAndFactors zero rate:" + itemzerorate)
+
     (userIdAndFactors, itemIdAndFactors)
   }
 
