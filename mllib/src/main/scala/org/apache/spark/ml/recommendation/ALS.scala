@@ -19,7 +19,6 @@ package org.apache.spark.ml.recommendation
 
 import java.{util => ju}
 
-
 import scala.collection.mutable
 import scala.math.sqrt
 import scala.reflect.ClassTag
@@ -30,7 +29,6 @@ import breeze.linalg.{DenseVector=>BrzVector, DenseMatrix=>BrzMatrix}
 import breeze.optimize.proximal.{ProximalL1, QuadraticMinimizer}
 import breeze.optimize.proximal.Constraint._
 import breeze.stats.regression.{newLasso=>lasso}
-
 
 import com.github.fommil.netlib.BLAS.{getInstance => blas}
 import com.github.fommil.netlib.LAPACK.{getInstance => lapack}
@@ -635,6 +633,12 @@ object ALS extends Logging {
       }
     val blockRatings = partitionRatings(ratings, userPart, itemPart)
       .persist(intermediateRDDStorageLevel)
+    println("==input===========================")
+    println(s"numUserBlocks: $numUserBlocks")
+    println(s"numItemBlocks: $numItemBlocks")
+    println("==ratings===========================")
+    ratings.take(50).foreach(println)
+    println("blockRatings:" + blockRatings.count + " ratings:" + ratings.count)
     val (userInBlocks, userOutBlocks) =
       makeBlocks("user", blockRatings, userPart, itemPart, intermediateRDDStorageLevel)
     // materialize blockRatings and user blocks
@@ -650,6 +654,11 @@ object ALS extends Logging {
     val seedGen = new XORShiftRandom(0L)
     var userFactors = initialize(userInBlocks, rank, seedGen.nextLong())
     var itemFactors = initialize(itemInBlocks, rank, seedGen.nextLong())
+
+    println("==ml.als===========================")
+    println(s"rank: $rank")
+    println("userOutBlocks:"+userOutBlocks.count()+", userFactors: "+userFactors.count()+", itemFactors: "+itemFactors.count())
+
     if (implicitPrefs) {
       for (iter <- 1 to maxIter) {
         userFactors.setName(s"userFactors-$iter").persist(intermediateRDDStorageLevel)
@@ -675,6 +684,7 @@ object ALS extends Logging {
         println("[warn] =iter " + iter.toString +"=================")
       }
     }
+
     val userIdAndFactors = userInBlocks
       .mapValues(_.srcIds)
       .join(userFactors)
@@ -707,38 +717,12 @@ object ALS extends Logging {
       itemOutBlocks.unpersist()
       blockRatings.unpersist()
     }
-
-    println("===userIdAndFactors====================================")
-    val zeroNum = sc.accumulator(0)
-    val totalNum = sc.accumulator(0)
-    userIdAndFactors.foreach{ x =>
-      println(x._1)
-      x._2.foreach{
-        x2 =>
-          print(x2.toString + " ")
-          if(math.abs(x2) < 1e-7) zeroNum += 1
-          totalNum += 1
-      }
-    }
-    val userzerorate = zeroNum.value.toDouble/totalNum.value
-
-    zeroNum.setValue(0)
-    totalNum.setValue(0)
-    println("===itemIdAndFactors====================================")
-    itemIdAndFactors.foreach{ x =>
-      println(x._1)
-      x._2.foreach{
-        x2 =>
-          print(x2.toString + " ")
-          if(math.abs(x2) < 1e-7) zeroNum += 1
-          totalNum += 1
-      }
-    }
-    val itemzerorate = zeroNum.value.toDouble/totalNum.value
-    println()
-    println("userIdAndFactors zero rate:" + userzerorate)
-    println("itemIdAndFactors zero rate:" + itemzerorate)
-
+    println("================================")
+    println("userInBlocks numbers:"+userInBlocks.count)
+    userInBlocks.foreach(println)
+    println("================================")
+    println("userIdAndFactors numbers:"+userIdAndFactors.count)
+    userInBlocks.foreach(println)
     (userIdAndFactors, itemIdAndFactors)
   }
 
@@ -811,6 +795,12 @@ object ALS extends Logging {
         val nrm = blas.snrm2(rank, factor, 1)
         blas.sscal(rank, 1.0f / nrm, factor, 1)
         factor
+      }
+      println("===================initialize inBlocks=======================")
+      println(s"srcBlockId: $srcBlockId")
+      factors.foreach { x =>
+        x.foreach(i => print(i + " "))
+        println
       }
       (srcBlockId, factors)
     }

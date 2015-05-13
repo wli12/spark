@@ -199,6 +199,7 @@ class ALS private (
     val sc = ratings.context
 
     val numUserBlocks = if (this.numUserBlocks == -1) {
+      println("sc.defaultParallelism: " + sc.defaultParallelism + ", ratings.partitions.size: "+ ratings.partitions.size)
       math.max(sc.defaultParallelism, ratings.partitions.size / 2)
     } else {
       this.numUserBlocks
@@ -224,6 +225,7 @@ class ALS private (
       intermediateRDDStorageLevel = intermediateRDDStorageLevel,
       finalRDDStorageLevel = StorageLevel.NONE,
       seed = seed)
+    println("ratings:"+ratings.count()+", userFactors: "+floatUserFactors.count()+", prodFactors: "+floatProdFactors.count())
 
     val userFactors = floatUserFactors
       .mapValues(_.map(_.toDouble))

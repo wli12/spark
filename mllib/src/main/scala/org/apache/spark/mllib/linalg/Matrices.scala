@@ -47,7 +47,7 @@ sealed trait Matrix extends Serializable {
   }
 
   /** Converts to a breeze matrix. */
-  private[mllib] def toBreeze: BM[Double]
+  def toBreeze: BM[Double]
 
   /** Gets the (i, j)-th element. */
   def apply(i: Int, j: Int): Double
@@ -152,7 +152,7 @@ class DenseMatrix(
     case _ => false
   }
 
-  private[mllib] def toBreeze: BM[Double] = {
+  def toBreeze: BM[Double] = {
     if (!isTransposed) {
       new BDM[Double](numRows, numCols, values)
     } else {
@@ -399,7 +399,7 @@ class SparseMatrix(
       rowIndices: Array[Int],
       values: Array[Double]) = this(numRows, numCols, colPtrs, rowIndices, values, false)
 
-  private[mllib] def toBreeze: BM[Double] = {
+  def toBreeze: BM[Double] = {
      if (!isTransposed) {
        new BSM[Double](values, numRows, numCols, colPtrs, rowIndices)
      } else {

@@ -44,14 +44,17 @@ import org.apache.spark.storage.StorageLevel
  *                     the features computed for this user.
  * @param productFeatures RDD of tuples where each tuple represents the productId
  *                        and the features computed for this product.
+ * @param numEntries number of entries used to train the model, only used in streaming setting
  */
 class MatrixFactorizationModel(
     val rank: Int,
     val userFeatures: RDD[(Int, Array[Double])],
-    val productFeatures: RDD[(Int, Array[Double])])
+    val productFeatures: RDD[(Int, Array[Double])],
+    val numEntries: Long = 0)
   extends Saveable with Serializable with Logging {
 
   require(rank > 0)
+  require(numEntries >= 0)
   validateFeatures("User", userFeatures)
   validateFeatures("Product", productFeatures)
 
@@ -182,7 +185,7 @@ object MatrixFactorizationModel extends Loader[MatrixFactorizationModel] {
       val sqlContext = new SQLContext(sc)
       import sqlContext.implicits._
       val metadata = compact(render(
-        ("class" -> thisClassName) ~ ("version" -> thisFormatVersion) ~ ("rank" -> model.rank)))
+        ("class" -> thisClassName) ~ ("version" -> thisFormatVersion) ~ ("rank" -> model.rank) ~ ("numEntries" -> model.numEntries) ))
       sc.parallelize(Seq(metadata), 1).saveAsTextFile(metadataPath(path))
       model.userFeatures.toDF("id", "features").saveAsParquetFile(userPath(path))
       model.productFeatures.toDF("id", "features").saveAsParquetFile(productPath(path))
@@ -195,6 +198,7 @@ object MatrixFactorizationModel extends Loader[MatrixFactorizationModel] {
       assert(className == thisClassName)
       assert(formatVersion == thisFormatVersion)
       val rank = (metadata \ "rank").extract[Int]
+      val numEntries = (metadata \ "numEntries").extract[Long]
       val userFeatures = sqlContext.parquetFile(userPath(path))
         .map { case Row(id: Int, features: Seq[_]) =>
           (id, features.asInstanceOf[Seq[Double]].toArray)
@@ -203,7 +207,7 @@ object MatrixFactorizationModel extends Loader[MatrixFactorizationModel] {
         .map { case Row(id: Int, features: Seq[_]) =>
         (id, features.asInstanceOf[Seq[Double]].toArray)
       }
-      new MatrixFactorizationModel(rank, userFeatures, productFeatures)
+      new MatrixFactorizationModel(rank, userFeatures, productFeatures, numEntries)
     }
 
     private def userPath(path: String): String = {
