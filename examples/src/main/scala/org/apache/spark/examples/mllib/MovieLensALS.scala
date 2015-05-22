@@ -56,7 +56,8 @@ object MovieLensALS {
     sgdStepSize: Double = 0.01,
     sgdNumIterations: Int =  5,
     sgdRegParam: Double = 1.0,
-    sgdBlockSize: Int = 1024) extends AbstractParams[Params]
+    sgdBlockSize: Int = 1024,
+    sgdDataRate: Double = 0.75) extends AbstractParams[Params]
 
   def main(args: Array[String]) {
     val defaultParams = Params()

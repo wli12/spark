@@ -2,7 +2,6 @@ package org.apache.spark.mllib.recommendation
 
 import org.apache.spark.Logging
 import org.apache.spark.annotation.Experimental
-import org.apache.spark.mllib.linalg.{Vectors, Vector}
 import org.apache.spark.mllib.linalg.distributed.MatrixEntry
 import org.apache.spark.streaming.dstream.DStream
 
@@ -78,7 +77,8 @@ extends Logging with Serializable {
     assertInitialized()
     data.foreachRDD { (rdd, time) =>
       if (rdd.count != 0)
-        model = algorithm.loadInitialWeights(model).train(rdd, rowsPerBlock, colsPerBlock)
+        // TODO : 这里使用的是merged model
+        model = algorithm.loadInitialWeights(model).train(rdd, rowsPerBlock, colsPerBlock)._2
     }
   }
 }

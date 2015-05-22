@@ -1,18 +1,15 @@
 package org.apache.spark.examples.mllib
 
+import breeze.optimize.proximal.Constraint
 import org.apache.log4j.{Level, Logger}
-import org.apache.spark.rdd.RDD
-import org.apache.spark.storage.StorageLevel
-import org.apache.spark.{SparkContext, SparkConf}
-import org.apache.spark.mllib.linalg.Vectors
+import org.apache.spark.examples.mllib.MovieLensALS.Params
 import org.apache.spark.mllib.linalg.distributed.MatrixEntry
 import org.apache.spark.mllib.recommendation._
-import org.apache.spark.streaming.dstream.DStream
+import org.apache.spark.rdd.RDD
+import org.apache.spark.storage.StorageLevel
 import org.apache.spark.streaming.{Seconds, StreamingContext}
-
-import org.apache.spark.examples.mllib.MovieLensALS.Params
-
-import breeze.optimize.proximal.Constraint
+import org.apache.spark.{SparkConf, SparkContext}
+import org.apache.spark.HashPartitioner
 import scopt.OptionParser
 
 import scala.collection.mutable
@@ -82,6 +79,9 @@ object StreamingMovieLensSGD {
       opt[Int]("sgdBlockSize")
         .text(s"number of entrys per col and row in the block, default: ${defaultParams.sgdBlockSize}")
         .action((x, c) => c.copy(sgdBlockSize = x))
+      opt[Double]("sgdDataRate")
+        .text(s"Rate of data for sgd, 0<=rate<=0.8 default: ${defaultParams.sgdDataRate}")
+        .action((x, c) => c.copy(sgdDataRate = x))
       arg[String]("<input>")
         .required()
         .text("input paths to a MovieLens dataset of ratings")
@@ -114,7 +114,7 @@ object StreamingMovieLensSGD {
     // TODO: 如果分布式测试的话，不要hard code这个parallelism
     val conf = new SparkConf().set("spark.default.parallelism", "4")
       .setAppName(s"StreamingMovieLensSGD with $params")
-      //.set("spark.driver.allowMultipleContexts", "true")
+    //.set("spark.driver.allowMultipleContexts", "true")
     if (params.kryo) {
       conf.registerKryoClasses(Array(classOf[mutable.BitSet], classOf[Rating]))
         .set("spark.kryoserializer.buffer.mb", "8")
@@ -125,6 +125,10 @@ object StreamingMovieLensSGD {
 
     Logger.getRootLogger.setLevel(Level.WARN)
 
+    println("=======trainWithUnitTest BEGIN====================================")
+    trainWithUnitTest(sc)
+    println("=======trainWithUnitTest END====================================")
+
     val delimiter = params.delimiter
 
     //0 将data切成三份儿data-batch-train, data-streaming, data-test
@@ -132,43 +136,181 @@ object StreamingMovieLensSGD {
       val fields = line.split(delimiter)
       Rating(fields(0).toInt, fields(1).toInt, fields(2).toDouble)
     }.cache()
-    val splits = ratings.randomSplit(Array(0.05, 0.75, 0.2), 1L)
-    val batchTrainingData = splits(0).cache()
-    val sgdTrainingData = splits(2).cache()
-    val testData = splits(1).cache()
-    ratings.unpersist(blocking = false)
 
-    val numTraining = batchTrainingData.count()
-    val numStream = sgdTrainingData.count()
+    val sgdDataRate = params.sgdDataRate
+    assert(sgdDataRate <= 0.8 && sgdDataRate >= 0)
+    val splits = ratings.randomSplit(Array(0.8 - sgdDataRate, sgdDataRate, 0.2), 1L)
+    val alsTrainingData = splits(0).cache()
+    val sgdTrainingData = splits(1).cache()
+    val testData = splits(2).cache()
+
+    val numALSTrain = alsTrainingData.count()
+    val numSGD = sgdTrainingData.count()
     val numTest = testData.count()
-    println(s"batchTrainingData: $numTraining, trainingSGDData: $numStream, testData: $numTest.")
+    println(s"alsTrainingData: $numALSTrain, trainingSGDData: $numSGD, testData: $numTest.")
 
-    val alsModel = trainWithALS(params, batchTrainingData)
-    val batchModel = new MatrixFactorizationModel(alsModel.rank, alsModel.userFeatures, alsModel.productFeatures, numTraining)
-    val batchRmse = MovieLensALS.computeRmse(batchModel, testData, params.implicitPrefs)
-    println(s"Test RMSE of Just Batch ALS Training= $batchRmse. " + batchModel.numEntries + " is used")
+    ratings.unpersist()
+
+    // TODO: 这里的baseline仅仅用来看看优化效果，由于get了流式数据，不符合实验设定，RMSE比实际更好
+    val (baselineRmse, avgbaselineRmse) = baseline(alsTrainingData.union(sgdTrainingData), testData)
+
+    println(s"Training " + 100 * (0.8 - sgdDataRate) + "% data with ALS frist")
+    val alsModel = trainWithALS(params, alsTrainingData)
+    val ALSbatchModel = new MatrixFactorizationModel(alsModel.rank, alsModel.userFeatures, alsModel.productFeatures, numALSTrain)
+    val ALSRmse = MovieLensALS.computeRmse(ALSbatchModel, testData, params.implicitPrefs)
+    println(s"Test RMSE of Just Batch ALS Training= $ALSRmse. " + ALSbatchModel.numEntries + " is used")
+
+    val ALSbatchimprovement = (baselineRmse - ALSRmse) / baselineRmse * 100
+    println("The Batch ALS model improves the baseline by " + "%1.2f".format(ALSbatchimprovement) + "%.")
+    val avgALSbatchimprovement = (avgbaselineRmse - ALSRmse) / avgbaselineRmse * 100
+    println("The Batch ALS model improves the avg baseline by " + "%1.2f".format(avgALSbatchimprovement) + "%.")
 
     // 2 load model1，基于这个在data-streaming上做streaming SGD train, save model2
     // 注意处理没见过的user和product
+    println(s"Training " + 100 * sgdDataRate + "% data with SGD after batch ALS")
     if(params.testStreaming) {
       println("*********** Training with Streaming SGD ***********")
-      val streamModel = trainWithStreamingSGD(params, sgdTrainingData, batchModel)
+      val streamModel = trainWithStreamingSGD(params, sgdTrainingData, ALSbatchModel)
       val streamRmse = MovieLensALS.computeRmse(streamModel, testData, params.implicitPrefs)
       println("*********** Model with Streaming SGD ***********")
       //printModel(streamModel,"streamSGDModel")
       println(s"Test RMSE of Streaming SGD Training= $streamRmse." + streamModel.numEntries + " is used")
     } else {
       println("*********** Training with Batch SGD ***********")
-      val batchSGDModel = trainWithBatchSGD(params, sgdTrainingData, batchModel)
+      val (batchSGDModel, mergedbatchSGDModel) = trainWithBatchSGD(params, sgdTrainingData, ALSbatchModel)
+
       val batchSGDRmse = MovieLensALS.computeRmse(batchSGDModel, testData, params.implicitPrefs)
       println("*********** Model with Batch SGD ***********")
       //printModel(batchSGDModel,"batchSGDModel")
       println(s"Test RMSE of Batch SGD Training= $batchSGDRmse. " + batchSGDModel.numEntries + " is used")
+      val batchSGDimprovement = (baselineRmse - batchSGDRmse) / baselineRmse * 100
+      println("The Batch SGD model improves the baseline by " + "%1.2f".format(batchSGDimprovement) + "%.")
+      val avgbatchSGDimprovement = (avgbaselineRmse - batchSGDRmse) / avgbaselineRmse * 100
+      println("The Batch SGD model improves the avg baseline by " + "%1.2f".format(avgbatchSGDimprovement) + "%.")
+      val ALSbatchSGDimprovement = (ALSRmse - batchSGDRmse) / ALSRmse * 100
+      println("The Batch SGD model improves the ALS by " + "%1.2f".format(ALSbatchSGDimprovement) + "%.")
+
+      val mergedbatchSGDRmse = MovieLensALS.computeRmse(mergedbatchSGDModel, testData, params.implicitPrefs)
+      println("*********** Model with merged Batch SGD ***********")
+      //printModel(mergedbatchSGDModel,"mergedbatchSGDModel")
+      println(s"Test RMSE of merged Batch SGD Training= $mergedbatchSGDRmse. " + mergedbatchSGDModel.numEntries + " is used")
+      val mergedbatchSGDimprovement = (baselineRmse - mergedbatchSGDRmse) / baselineRmse * 100
+      println("The merged Batch SGD model improves the baseline by " + "%1.2f".format(mergedbatchSGDimprovement) + "%.")
+      val avgmergedbatchSGDimprovement = (avgbaselineRmse - mergedbatchSGDRmse) / avgbaselineRmse * 100
+      println("The merged Batch SGD model improves the avg baseline by " + "%1.2f".format(avgmergedbatchSGDimprovement) + "%.")
+      val ALSmergedbatchSGDimprovement = (ALSRmse - mergedbatchSGDRmse) / ALSRmse * 100
+      println("The merged Batch SGD model improves the ALS by " + "%1.2f".format(ALSmergedbatchSGDimprovement) + "%.")
+
+
+      computeRMSE(ALSbatchModel, batchSGDModel, mergedbatchSGDModel, alsTrainingData, sgdTrainingData, testData)
     }
+
     println("*********** Model with Just Batch ALS ***********")
-    //printModel(batchModel,"batchALSModel")
-    println(s"Test RMSE of Just Batch ALS Training= $batchRmse. " + batchModel.numEntries + " is used")
-    println(s"trainingData for als: $numTraining, trainingData for sgd: $numStream, testData: $numTest.")
+    //printModel(ALSbatchModel,"batchALSModel")
+    println(s"Test RMSE of Just Batch ALS Training= $ALSRmse. " + ALSbatchModel.numEntries + " is used")
+    println("The Batch ALS model improves the baseline by " + "%1.2f".format(ALSbatchimprovement) + "%.")
+    println("The Batch ALS model improves the avg baseline by " + "%1.2f".format(avgALSbatchimprovement) + "%.")
+    println(s"trainingData for als: $numALSTrain, trainingData for sgd: $numSGD, testData: $numTest.")
+    println(s"Baseline RMSE: $baselineRmse")
+    println(s"AVG Baseline RMSE: $avgbaselineRmse")
+
+    import java.util.Calendar
+    import java.text.SimpleDateFormat
+    val today = Calendar.getInstance.getTime
+    val curTimeFormat = new SimpleDateFormat("yy-MM-dd HH:mm:ss")
+    println("completed " + curTimeFormat.format(today))
+
+    alsTrainingData.unpersist()
+    sgdTrainingData.unpersist()
+    testData.unpersist()
+  }
+
+  def baseline(trainingData: RDD[Rating], testData: RDD[Rating]) = {
+    // create a naive baseline and compare it with the best model
+    val meanRating: Double = trainingData.map(_.rating).mean
+    val baselineRmse =
+      math.sqrt(testData.map(x => (meanRating - x.rating) * (meanRating - x.rating)).mean)
+
+    // create a avarage baseline
+    val avgRating: Map[Int, Double] = trainingData.map{ x => (x.product, x.rating)}.combineByKey(
+      (v) => (v, 1),
+      (c:(Double, Int), v) => (c._1 + v, c._2 + 1),
+      (c1:(Double, Int), c2:(Double, Int)) => (c1._1 + c2._1, c1._2 + c2._2)
+    ).mapValues(x => x._1/x._2).collect.toMap
+    val avgbaselineRmse =
+      math.sqrt(testData.map(x =>
+        if (avgRating.contains(x.product)) {
+          (avgRating(x.product) - x.rating) * (avgRating(x.product) - x.rating)
+        } else {
+          (meanRating - x.rating) * (meanRating - x.rating)
+        }).mean)
+
+    (baselineRmse, avgbaselineRmse)
+  }
+
+  def computeRMSE(ALSModel: MatrixFactorizationModel, SGDModel: MatrixFactorizationModel, mergedModel: MatrixFactorizationModel,
+                  alsTrainingData:RDD[Rating], sgdTrainingData:RDD[Rating], testData: RDD[Rating]): List[Double] = {
+    val alsUserKeys = alsTrainingData.map(x => x.user).collect.toSet
+    val alsProductKeys = alsTrainingData.map(x => x.product).collect.toSet
+
+    val sgdUserKeys = sgdTrainingData.map(x => x.user).collect.toSet ++ alsUserKeys
+    val sgdProductKeys = sgdTrainingData.map(x => x.product).collect.toSet ++ alsProductKeys
+
+    val oldTestData = testData.filter{
+      x =>  alsUserKeys.contains(x.user) && alsProductKeys.contains(x.product)
+    }
+    val newTestData = testData.filter{
+      x => !(alsUserKeys.contains(x.user) && alsProductKeys.contains(x.product)) &&
+        (sgdUserKeys.contains(x.user) && sgdProductKeys.contains(x.product))
+    }
+    newTestData.map(x=>(x.user,x.product)).foreach(println)
+    println(sgdUserKeys -- alsUserKeys)
+    println(sgdProductKeys -- alsProductKeys)
+    println(s"oldTestData count: "+oldTestData.count +" newTestData count: "+ newTestData.count)
+    println(s"alsUserKeys count: "+alsUserKeys.size +" sgdUserKeys count: "+ sgdUserKeys.size)
+    println(s"alsProductKeys count: "+alsProductKeys.size +" sgdProductKeys count: "+ sgdProductKeys.size)
+
+    val oldalsRmse = MovieLensALS.computeRmse(ALSModel, oldTestData, false)
+    val newalsRmse_invalid = MovieLensALS.computeRmse(ALSModel, newTestData, false)
+
+    val (oldbaselineRmse, oldavgbaselineRmse) = baseline(alsTrainingData, oldTestData)
+    val (newbaselineRmse, newavgbaselineRmse) = baseline(alsTrainingData, newTestData)
+
+    val oldsgdRmse = MovieLensALS.computeRmse(SGDModel, oldTestData, false)
+    val newsgdRmse = MovieLensALS.computeRmse(SGDModel, newTestData, false)
+
+    val oldmergedRmse = MovieLensALS.computeRmse(mergedModel, oldTestData, false)
+    val newmergedRmse = MovieLensALS.computeRmse(mergedModel, newTestData, false)
+
+    println("=============================================================")
+    println("************ old/new data RMSE compare ***********************")
+    println("=============================================================")
+    println(s"oldbaselineRmse:$oldbaselineRmse"+'\t'+s" newbaselineRmse:$newbaselineRmse, " + '\n' +
+      s"oldavgbaselineRmse:$oldavgbaselineRmse"+'\t'+s" newavgbaselineRmse:$newavgbaselineRmse, " + '\n' +
+      s"oldalsRmse:$oldalsRmse"+'\t'+s" newalsRmse_invalid:$newalsRmse_invalid, " + '\n' +
+      s"oldsgdRmse:$oldsgdRmse"+'\t'+s" newsgdRmse:$newsgdRmse, " + '\n' +
+      s"oldmergedRmse:$oldmergedRmse"+'\t'+s" newmergedRmse:$newmergedRmse")
+
+    List(oldalsRmse, newalsRmse_invalid, newbaselineRmse, newavgbaselineRmse, oldsgdRmse, oldsgdRmse, oldmergedRmse, oldmergedRmse)
+  }
+
+  def printFeatures(features:RDD[(Int, Array[Double])]) = {
+    features.collect.foreach {
+      case (i, arr) =>
+        println(i)
+        arr.foreach(x => print(x + "\t"))
+        println
+    }
+  }
+
+  def printModel(model: MatrixFactorizationModel, log: String = "") = {
+    println("================================================")
+    println(s"*******Model for $log****************************")
+    println("================================================")
+    println("======userFeatures=====================")
+    printFeatures(model.userFeatures)
+    println("======productFeatures=====================")
+    printFeatures(model.productFeatures)
   }
 
   def trainWithALS(params: Params, batchTrainingData: RDD[Rating]) =  {
@@ -194,7 +336,8 @@ object StreamingMovieLensSGD {
     als.run(batchTrainingData)
   }
 
-  def trainWithBatchSGD(params: Params, sgdTrainingData: RDD[Rating], batchModel: MatrixFactorizationModel) = {
+  def trainWithBatchSGD(params: Params, sgdTrainingData: RDD[Rating],
+                        batchModel: MatrixFactorizationModel): (MatrixFactorizationModel, MatrixFactorizationModel)  = {
     val batchSGDDataFile = sgdTrainingData.map{
       case Rating(i, j, ratings) => MatrixEntry(i, j, ratings)
     }
@@ -207,83 +350,8 @@ object StreamingMovieLensSGD {
       .train(batchSGDDataFile, params.sgdBlockSize, params.sgdBlockSize)
   }
 
-  def trainWithUnitTest(params: Params, sc: SparkContext) = {
-    val initratings = List(
-      Rating(1,1,1),
-      Rating(1,2,1),
-      Rating(2,1,3),
-      Rating(2,3,3),
-      Rating(3,2,5),
-      Rating(3,3,4),
-      Rating(3,4,1))
-    val inituser = List(
-      (1, Array(-0.7, 0.8)),
-      (2, Array(0.5, -0.6)),
-      (3, Array(0.9, -0.8)))
-    val initprod = List(
-      (1, Array(0.9, -0.2)),
-      (2, Array(0.5, -0.3)),
-      (3, Array(0.2, -0.1)),
-      (4, Array(-0.5, 0.7)))
-    /*
-    (0,((((0,0),4 x 5 CSCMatrix
-(1,1) 1.0
-(2,1) 3.0
-(1,2) 1.0
-(3,2) 5.0
-(2,3) 3.0
-(3,3) 4.0
-(3,4) 1.0),Some(0.0   0.0
--0.7  0.8
-0.5   -0.6
-0.9   -0.8  )),Some(0.0   0.0
-0.9   -0.2
-0.5   -0.3
-0.2   -0.1
--0.5  0.7   )))
-     */
-    val rank = 2
-    val sgdTrainingData: RDD[Rating] = sc.parallelize(initratings)
-    val userFeatures: RDD[(Int, Array[Double])] = sc.parallelize(inituser)
-    val productFeatures: RDD[(Int, Array[Double])] = sc.parallelize(initprod)
-    val model: MatrixFactorizationModel = new  MatrixFactorizationModel(rank, userFeatures, productFeatures)
-    val params = Params(sgdNumIterations = 3, sgdStepSize = 0.05, sgdRegParam = 1)
-
-    val unitTestModel =  trainWithBatchSGD(params, sgdTrainingData, model)
-    println("=======trainWithUnitTest Model===========================")
-    printFeatures(unitTestModel.userFeatures)
-    printFeatures(unitTestModel.productFeatures)
-
-
-    val ratings: RDD[MatrixEntry] = sgdTrainingData.map{
-      case Rating(i, j, ratings) => MatrixEntry(i, j, ratings)
-    }
-    val rowsPerBlock: Int = 1024
-    val colsPerBlock: Int = 1024
-    val intermediateRDDStorageLevel: StorageLevel = StorageLevel.MEMORY_AND_DISK
-    val finalRDDStorageLevel: StorageLevel = StorageLevel.MEMORY_AND_DISK
-  }
-
-  def printFeatures(features:RDD[(Int, Array[Double])]) = {
-    features.collect.foreach {
-      case (i, arr) =>
-        println(i)
-        arr.foreach(x => print(x + "\t"))
-        println
-    }
-  }
-
-  def printModel(model: MatrixFactorizationModel, log: String = "") = {
-    println("================================================")
-    println(s"*******Model for $log****************************")
-    println("================================================")
-    println("======userFeatures=====================")
-    printFeatures(model.userFeatures)
-    println("======productFeatures=====================")
-    printFeatures(model.productFeatures)
-  }
-
-  def trainWithStreamingSGD(params: Params, sgdTrainingData: RDD[Rating], batchModel: MatrixFactorizationModel) = {
+  def trainWithStreamingSGD(params: Params, sgdTrainingData: RDD[Rating],
+                            batchModel: MatrixFactorizationModel): MatrixFactorizationModel = {
     println("&&&&&&&&&&&&&&&& enter trainWithStreamingSGD &&&&&&&&&&&&&&&&&&&&&&&&&&&")
     // TODO: 不要hard code这个 batchDuration
     val ssc = new StreamingContext(sgdTrainingData.sparkContext, Seconds(5))
@@ -316,5 +384,49 @@ object StreamingMovieLensSGD {
 
     // 3 比较model1和model2的效果（策略是遇到没见过的user就算平均），然后
     streamingAlgorithm.latestModel()
+  }
+
+  def trainWithUnitTest(sc: SparkContext) = {
+    val initratings = List(
+      Rating(1,1,1),
+      Rating(1,2,1),
+      Rating(2,1,3),
+      Rating(2,3,3),
+      Rating(3,2,5),
+      Rating(3,3,4),
+      Rating(3,4,1))
+    val inituser = List(
+      (1, Array(-0.7, 0.8)),
+      (2, Array(0.5, -0.6)),
+      (3, Array(0.9, -0.8)))
+    val initprod = List(
+      (1, Array(0.9, -0.2)),
+      (2, Array(0.5, -0.3)),
+      (3, Array(0.2, -0.1)),
+      (4, Array(-0.5, 0.7)))
+
+    val rank = 2
+    val sgdTrainingData: RDD[Rating] = sc.parallelize(initratings)
+    val userFeatures: RDD[(Int, Array[Double])] = sc.parallelize(inituser)
+    val productFeatures: RDD[(Int, Array[Double])] = sc.parallelize(initprod)
+    val model: MatrixFactorizationModel = new  MatrixFactorizationModel(rank, userFeatures, productFeatures)
+    val params = Params(sgdNumIterations = 3, sgdStepSize = 0.05, sgdRegParam = 1)
+
+    val (unitTestModel, mergedUnitTestModel) = trainWithBatchSGD(params, sgdTrainingData, model)
+    println("=======trainWithUnitTest Model===========================")
+    printFeatures(unitTestModel.userFeatures)
+    printFeatures(unitTestModel.productFeatures)
+
+    /*
+    val ratings: RDD[MatrixEntry] = sgdTrainingData.map{
+      case Rating(i, j, ratings) => MatrixEntry(i, j, ratings)
+    }
+    val rowsPerBlock: Int = 1024
+    val colsPerBlock: Int = 1024
+    val intermediateRDDStorageLevel: StorageLevel = StorageLevel.MEMORY_AND_DISK
+    val finalRDDStorageLevel: StorageLevel = StorageLevel.MEMORY_AND_DISK
+
+    import org.apache.spark.mllib.recommendation.MatrixFactorizationWithSGD._
+    */
   }
 }

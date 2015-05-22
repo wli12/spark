@@ -796,12 +796,14 @@ object ALS extends Logging {
         blas.sscal(rank, 1.0f / nrm, factor, 1)
         factor
       }
+      /*
       println("===================initialize inBlocks=======================")
       println(s"srcBlockId: $srcBlockId")
       factors.foreach { x =>
         x.foreach(i => print(i + " "))
         println
       }
+      */
       (srcBlockId, factors)
     }
   }
