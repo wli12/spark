@@ -223,9 +223,9 @@ class ALS private (
       userConstraint = userConstraint,
       itemConstraint = productConstraint,
       intermediateRDDStorageLevel = intermediateRDDStorageLevel,
-      finalRDDStorageLevel = StorageLevel.NONE,
+      finalRDDStorageLevel = finalRDDStorageLevel,
       seed = seed)
-    println("ratings:"+ratings.count()+", userFactors: "+floatUserFactors.count()+", prodFactors: "+floatProdFactors.count())
+    //println("ratings:"+ratings.count()+", userFactors: "+floatUserFactors.count()+", prodFactors: "+floatProdFactors.count())
 
     val userFactors = floatUserFactors
       .mapValues(_.map(_.toDouble))
@@ -238,6 +238,8 @@ class ALS private (
     if (finalRDDStorageLevel != StorageLevel.NONE) {
       userFactors.count()
       prodFactors.count()
+      floatUserFactors.unpersist()
+      floatProdFactors.unpersist()
     }
     new MatrixFactorizationModel(rank, userFactors, prodFactors)
   }

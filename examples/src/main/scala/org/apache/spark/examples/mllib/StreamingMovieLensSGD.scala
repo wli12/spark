@@ -13,6 +13,8 @@ import org.apache.spark.HashPartitioner
 import scopt.OptionParser
 
 import scala.collection.mutable
+import java.util.Calendar
+import java.text.SimpleDateFormat
 
 object StreamingMovieLensSGD {
 
@@ -23,7 +25,7 @@ object StreamingMovieLensSGD {
     val userConstraints = Constraint.values.toList.mkString(",")
     val productConstraints = Constraint.values.toList.mkString(",")
 
-    val parser = new OptionParser[Params]("MovieLensALS") {
+    val parser = new OptionParser[Params]("StreamingMovieLensSGD") {
       head("MovieLensALS: an example app for ALS on MovieLens data.")
       opt[Int]("rank")
         .text(s"rank, default: ${defaultParams.rank}}")
@@ -76,12 +78,18 @@ object StreamingMovieLensSGD {
       opt[Double]("sgdRegParam")
         .text(s"RegParam for sgd, default: ${defaultParams.sgdRegParam}")
         .action((x, c) => c.copy(sgdRegParam = x))
-      opt[Int]("sgdBlockSize")
-        .text(s"number of entrys per col and row in the block, default: ${defaultParams.sgdBlockSize}")
-        .action((x, c) => c.copy(sgdBlockSize = x))
+      opt[Int]("rowsPerBlock")
+        .text(s"number of entrys per col and row in the block, default: ${defaultParams.rowsPerBlock}")
+        .action((x, c) => c.copy(rowsPerBlock = x))
+      opt[Int]("colsPerBlock")
+        .text(s"number of col and row of blocks, default: ${defaultParams.colsPerBlock}")
+        .action((x, c) => c.copy(colsPerBlock = x))
       opt[Double]("sgdDataRate")
         .text(s"Rate of data for sgd, 0<=rate<=0.8 default: ${defaultParams.sgdDataRate}")
         .action((x, c) => c.copy(sgdDataRate = x))
+      opt[Unit]("timeStamp")
+        .text("Partition the data by timestamp")
+        .action((_, c) => c.copy(timeStamp = true))
       arg[String]("<input>")
         .required()
         .text("input paths to a MovieLens dataset of ratings")
@@ -112,16 +120,24 @@ object StreamingMovieLensSGD {
 
   def run(params: Params) {
     // TODO: 如果分布式测试的话，不要hard code这个parallelism
-    val conf = new SparkConf().set("spark.default.parallelism", "4")
+    val conf = new SparkConf()
       .setAppName(s"StreamingMovieLensSGD with $params")
-    //.set("spark.driver.allowMultipleContexts", "true")
     if (params.kryo) {
       conf.registerKryoClasses(Array(classOf[mutable.BitSet], classOf[Rating]))
         .set("spark.kryoserializer.buffer.mb", "8")
     }
     val sc = new SparkContext(conf)
+    println("===Let's Go====================")
+    printTime()
     println("===sc.defaultParallelism====================")
     println(sc.defaultParallelism)
+    if(sc.defaultParallelism < 8) {
+      sc.conf.set("spark.default.parallelism", "8")
+    }
+    println(sc.defaultParallelism)
+    println("checkpointDir:" + sc.checkpointDir)
+    sc.setCheckpointDir("spark-checkpoint-dir")
+    println("checkpointDir:" + sc.checkpointDir)
 
     Logger.getRootLogger.setLevel(Level.WARN)
 
@@ -131,25 +147,28 @@ object StreamingMovieLensSGD {
 
     val delimiter = params.delimiter
 
-    //0 将data切成三份儿data-batch-train, data-streaming, data-test
-    val ratings = sc.textFile(params.input).map { line =>
-      val fields = line.split(delimiter)
-      Rating(fields(0).toInt, fields(1).toInt, fields(2).toDouble)
-    }.cache()
-
     val sgdDataRate = params.sgdDataRate
     assert(sgdDataRate <= 0.8 && sgdDataRate >= 0)
-    val splits = ratings.randomSplit(Array(0.8 - sgdDataRate, sgdDataRate, 0.2), 1L)
-    val alsTrainingData = splits(0).cache()
-    val sgdTrainingData = splits(1).cache()
-    val testData = splits(2).cache()
 
+    //0 将data切成三份儿data-batch-train, data-streaming, data-test
+    def getSplits(input: String):(RDD[Rating], RDD[Rating], RDD[Rating]) = {
+      val ratings = sc.textFile(input).map { line =>
+        val fields = line.split(delimiter)
+        Rating(fields(0).toInt, fields(1).toInt, fields(2).toDouble)
+      }
+      val splits = ratings.randomSplit(Array(0.8 - sgdDataRate, sgdDataRate, 0.2), 1L)
+      (splits(0), splits(1), splits(2))
+    }
+
+    val (alsTrainingData, sgdTrainingData, testData) = getSplits(params.input)
+    alsTrainingData.setName("alsTrainingData").persist(StorageLevel.MEMORY_AND_DISK)
+    sgdTrainingData.setName("sgdTrainingData").persist(StorageLevel.MEMORY_AND_DISK)
+    testData.setName("testData").persist(StorageLevel.MEMORY_AND_DISK)
+    // Activate persist
     val numALSTrain = alsTrainingData.count()
     val numSGD = sgdTrainingData.count()
     val numTest = testData.count()
     println(s"alsTrainingData: $numALSTrain, trainingSGDData: $numSGD, testData: $numTest.")
-
-    ratings.unpersist()
 
     // TODO: 这里的baseline仅仅用来看看优化效果，由于get了流式数据，不符合实验设定，RMSE比实际更好
     val (baselineRmse, avgbaselineRmse) = baseline(alsTrainingData.union(sgdTrainingData), testData)
@@ -157,6 +176,8 @@ object StreamingMovieLensSGD {
     println(s"Training " + 100 * (0.8 - sgdDataRate) + "% data with ALS frist")
     val alsModel = trainWithALS(params, alsTrainingData)
     val ALSbatchModel = new MatrixFactorizationModel(alsModel.rank, alsModel.userFeatures, alsModel.productFeatures, numALSTrain)
+    ALSbatchModel.userFeatures.checkpoint()
+    ALSbatchModel.productFeatures.checkpoint()
     val ALSRmse = MovieLensALS.computeRmse(ALSbatchModel, testData, params.implicitPrefs)
     println(s"Test RMSE of Just Batch ALS Training= $ALSRmse. " + ALSbatchModel.numEntries + " is used")
 
@@ -201,7 +222,6 @@ object StreamingMovieLensSGD {
       val ALSmergedbatchSGDimprovement = (ALSRmse - mergedbatchSGDRmse) / ALSRmse * 100
       println("The merged Batch SGD model improves the ALS by " + "%1.2f".format(ALSmergedbatchSGDimprovement) + "%.")
 
-
       computeRMSE(ALSbatchModel, batchSGDModel, mergedbatchSGDModel, alsTrainingData, sgdTrainingData, testData)
     }
 
@@ -214,24 +234,27 @@ object StreamingMovieLensSGD {
     println(s"Baseline RMSE: $baselineRmse")
     println(s"AVG Baseline RMSE: $avgbaselineRmse")
 
-    import java.util.Calendar
-    import java.text.SimpleDateFormat
-    val today = Calendar.getInstance.getTime
-    val curTimeFormat = new SimpleDateFormat("yy-MM-dd HH:mm:ss")
-    println("completed " + curTimeFormat.format(today))
+    printTime()
 
     alsTrainingData.unpersist()
     sgdTrainingData.unpersist()
     testData.unpersist()
   }
 
+  def printTime() = {
+    val today = Calendar.getInstance.getTime
+    val curTimeFormat = new SimpleDateFormat("yy-MM-dd HH:mm:ss")
+    println("completed " + curTimeFormat.format(today))
+  }
+
+  // TODO: 有collect操作，长度为product数量的Map
   def baseline(trainingData: RDD[Rating], testData: RDD[Rating]) = {
     // create a naive baseline and compare it with the best model
     val meanRating: Double = trainingData.map(_.rating).mean
     val baselineRmse =
       math.sqrt(testData.map(x => (meanRating - x.rating) * (meanRating - x.rating)).mean)
 
-    // create a avarage baseline
+    // create a baseline based on avarage rating for old product and meanRating for new product
     val avgRating: Map[Int, Double] = trainingData.map{ x => (x.product, x.rating)}.combineByKey(
       (v) => (v, 1),
       (c:(Double, Int), v) => (c._1 + v, c._2 + 1),
@@ -244,17 +267,17 @@ object StreamingMovieLensSGD {
         } else {
           (meanRating - x.rating) * (meanRating - x.rating)
         }).mean)
-
     (baselineRmse, avgbaselineRmse)
   }
 
+  //有collect，大小为User/Procuct key size的几个set
   def computeRMSE(ALSModel: MatrixFactorizationModel, SGDModel: MatrixFactorizationModel, mergedModel: MatrixFactorizationModel,
                   alsTrainingData:RDD[Rating], sgdTrainingData:RDD[Rating], testData: RDD[Rating]): List[Double] = {
-    val alsUserKeys = alsTrainingData.map(x => x.user).collect.toSet
-    val alsProductKeys = alsTrainingData.map(x => x.product).collect.toSet
+    val alsUserKeys = alsTrainingData.map(x => x.user).distinct.collect.toSet
+    val alsProductKeys = alsTrainingData.map(x => x.product).distinct.collect.toSet
 
-    val sgdUserKeys = sgdTrainingData.map(x => x.user).collect.toSet ++ alsUserKeys
-    val sgdProductKeys = sgdTrainingData.map(x => x.product).collect.toSet ++ alsProductKeys
+    val sgdUserKeys = sgdTrainingData.map(x => x.user).distinct.collect.toSet ++ alsUserKeys
+    val sgdProductKeys = sgdTrainingData.map(x => x.product).distinct.collect.toSet ++ alsProductKeys
 
     val oldTestData = testData.filter{
       x =>  alsUserKeys.contains(x.user) && alsProductKeys.contains(x.product)
@@ -295,7 +318,7 @@ object StreamingMovieLensSGD {
   }
 
   def printFeatures(features:RDD[(Int, Array[Double])]) = {
-    features.collect.foreach {
+    features.foreach {
       case (i, arr) =>
         println(i)
         arr.foreach(x => print(x + "\t"))
@@ -341,13 +364,16 @@ object StreamingMovieLensSGD {
     val batchSGDDataFile = sgdTrainingData.map{
       case Rating(i, j, ratings) => MatrixEntry(i, j, ratings)
     }
+
     //TODO:由于我们并没有做采样，因此numIterations的意思就是把整个数据集过多少遍
     new MatrixFactorizationWithSGD()
       .setStepSize(params.sgdStepSize)
       .setNumIterations(params.sgdNumIterations)
       .setRegParam(params.sgdRegParam)
       .loadInitialWeights(batchModel)
-      .train(batchSGDDataFile, params.sgdBlockSize, params.sgdBlockSize)
+      .setUserBlocks(params.numUserBlocks)
+      .setProductBlocks(params.numProductBlocks)
+      .train(batchSGDDataFile, params.rowsPerBlock, params.colsPerBlock)
   }
 
   def trainWithStreamingSGD(params: Params, sgdTrainingData: RDD[Rating],
@@ -376,9 +402,11 @@ object StreamingMovieLensSGD {
       .setStepSize(params.sgdStepSize)
       .setNumIterations(params.sgdNumIterations)
       .setRegParam(params.sgdRegParam)
+      .setUserBlocks(params.numUserBlocks)
+      .setProductBlocks(params.numProductBlocks)
       .loadInitialWeights(batchModel)
 
-    streamingAlgorithm.run(trainingStreamData, params.sgdBlockSize, params.sgdBlockSize)
+    streamingAlgorithm.run(trainingStreamData, params.rowsPerBlock, params.colsPerBlock)
     ssc.start()
     ssc.awaitTermination()
 

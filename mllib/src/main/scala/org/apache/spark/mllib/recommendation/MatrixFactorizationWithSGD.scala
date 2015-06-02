@@ -1,19 +1,22 @@
 package org.apache.spark.mllib.recommendation
 
 import breeze.linalg.{DenseMatrix => BrzMatrix, DenseVector => BrzVector, shuffle}
-import org.apache.spark.Logging
-import org.apache.spark.mllib.linalg.distributed.{BlockMatrix, CoordinateMatrix, IndexedRow, IndexedRowMatrix, MatrixEntry}
-import org.apache.spark.mllib.linalg.{DenseVector, Matrices}
+import org.apache.spark.{HashPartitioner, Logging}
+import org.apache.spark.mllib.linalg.distributed.{BlockMatrix, IndexedRowMatrix, CoordinateMatrix, IndexedRow, MatrixEntry}
+import org.apache.spark.mllib.linalg.{DenseVector, Matrices, Matrix}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 
+
 class MatrixFactorizationWithSGD  private[mllib] (
+  private var numUserBlocks: Int,
+  private var numProductBlocks: Int,
   private var stepSize: Double, //initial step size for the first step
   private var numIterations: Int, //number of iterations that SGD would run through the whole data set
   private var regParam: Double) //L2 regularization parameter
   extends Logging with Serializable {
 
-  def this() = this(0.1, 50, 1.0)
+  def this() = this(-1, -1, 0.01, 30, 0.1)
 
   /** Set the step size for gradient descent. Default: 0.1. */
   def setStepSize(stepSize: Double): this.type = {
@@ -33,13 +36,108 @@ class MatrixFactorizationWithSGD  private[mllib] (
     this
   }
 
-  /** The model to be updated and used for prediction. */
-  protected var model: MatrixFactorizationModel = null
+  /**
+   * Set the number of blocks for both user blocks and product blocks to parallelize the computation
+   * into; pass -1 for an auto-configured number of blocks. Default: -1.
+   */
+  def setBlocks(numBlocks: Int): this.type = {
+    this.numUserBlocks = numBlocks
+    this.numProductBlocks = numBlocks
+    this
+  }
+
+  /**
+   * Set the number of user blocks to parallelize the computation.
+   */
+  def setUserBlocks(numUserBlocks: Int): this.type = {
+    this.numUserBlocks = numUserBlocks
+    this
+  }
+
+  /**
+   * Set the number of product blocks to parallelize the computation.
+   */
+  def setProductBlocks(numProductBlocks: Int): this.type = {
+    this.numProductBlocks = numProductBlocks
+    this
+  }
 
   /** Set the initial weights. Default: [0.0, 0.0]. */
   def loadInitialWeights(matrixFactorizationModel: MatrixFactorizationModel): this.type = {
     this.model = matrixFactorizationModel
     this
+  }
+
+  /** The model to be updated and used for prediction. */
+  protected var model: MatrixFactorizationModel = null
+
+  /**
+   * Partitioner used by SGD.
+   */
+  private[recommendation] type SGDPartitioner = org.apache.spark.HashPartitioner
+
+  def getPartitioner(ratings: RDD[MatrixEntry]) = {
+    val sc = ratings.sparkContext
+    val numUserBlocks = if (this.numUserBlocks == -1) {
+      println("sc.defaultParallelism: " + sc.defaultParallelism + ", ratings.partitions.size: "+ ratings.partitions.size)
+      math.max(sc.defaultParallelism, ratings.partitions.size / 2)
+    } else {
+      this.numUserBlocks
+    }
+    val numProductBlocks = if (this.numProductBlocks == -1) {
+      math.max(sc.defaultParallelism, ratings.partitions.size / 2)
+    } else {
+      this.numProductBlocks
+    }
+    val userPartitioner = new SGDPartitioner(numUserBlocks)
+    val productPartitioner = new SGDPartitioner(numProductBlocks)
+    (userPartitioner, productPartitioner)
+  }
+
+  def newModel(rank: Int,
+               blockUserFeatures: RDD[(Int, BrzMatrix[Double])],
+               blockProductFeatures: RDD[(Int, BrzMatrix[Double])],
+               numEntries: Long,
+               rowsPerBlock: Int,
+               colsPerBlock: Int,
+               RDDStorageLevel: StorageLevel): MatrixFactorizationModel = {
+    // 这里加HashPartitioner但并不需要跟其他RDD协作，只是为了增加并行度加速预测
+    val numRowBlocks = blockUserFeatures.count.toInt
+    val numColBlocks = blockProductFeatures.count.toInt
+    val modelUserFeatures = new BlockMatrix(blockUserFeatures.map(x => ((x._1, 0), Matrices.fromBreeze(x._2))), rowsPerBlock, rank)
+      .toIndexedRowMatrix().rows.map{
+      case IndexedRow(i, features) =>
+        (i.toInt, features.toArray)
+    }.partitionBy(new HashPartitioner(numRowBlocks)).setName("modelUserFeatures").persist(RDDStorageLevel)
+    val modelProductFeatures = new BlockMatrix(blockProductFeatures.map(x => ((x._1, 0), Matrices.fromBreeze(x._2))), colsPerBlock, rank)
+      .toIndexedRowMatrix().rows.map{
+      case IndexedRow(i, features) =>
+        (i.toInt, features.toArray)
+    }.partitionBy(new HashPartitioner(numColBlocks)).setName("modelProductFeatures").persist(RDDStorageLevel)
+    new MatrixFactorizationModel(rank, modelUserFeatures, modelProductFeatures, numEntries)
+  }
+
+  def fillFeatures(features: RDD[(Int, Array[Double])], dataKeys: RDD[Int], rank: Int): RDD[(Int, Array[Double])] = {
+    /*
+    // Fill features with avg values
+    val avgValue = features.aggregate[BrzVector[Double]](BrzVector.zeros(rank)) (
+      (U, T) => (U + new BrzVector(T._2)),
+      (U1, U2) => (U1 + U2)
+    )
+    avgValue /= features.count.toDouble
+    val avgArray = avgValue.toArray
+    */
+    val avgArray = BrzVector.zeros[Double](rank).toArray
+
+    println("init Value for missing user/products")
+    avgArray.foreach(x => print(x + " "))
+    println
+
+    val avgFeatures = dataKeys.subtract(features.keys).map{x=>(x, avgArray.clone)}
+    println("avgFeatures.count:" + avgFeatures.count)
+    avgFeatures.foreach(x => print(x._1 + ", "))
+    println
+    features.union(avgFeatures)
   }
 
   /**
@@ -52,39 +150,80 @@ class MatrixFactorizationWithSGD  private[mllib] (
       colsPerBlock: Int = 1024,
       intermediateRDDStorageLevel: StorageLevel = StorageLevel.MEMORY_AND_DISK,
       finalRDDStorageLevel: StorageLevel = StorageLevel.MEMORY_AND_DISK): (MatrixFactorizationModel, MatrixFactorizationModel) = {
+    val sc = ratings.sparkContext
     val rank = model.rank
     val userFeatures = model.userFeatures
     val productFeatures = model.productFeatures
     val historyNum = model.numEntries
+
+    val (userPartitioner, productPartitioner) = getPartitioner(ratings)
+
     val currentNum = ratings.count
+    var sofarNum = historyNum
     val historyRate = historyNum.toDouble / (historyNum + currentNum)
     val currentRate = 1 - historyRate
-
-    var sofarNum = historyNum
-    val initRMSE = MatrixFactorizationWithSGD.rddRmse(model, ratings)
-    val initArrayRMSE = MatrixFactorizationWithSGD.rddToArrayRmse(model, ratings)
-    val initArrayRMSE2 = MatrixFactorizationWithSGD.rddToArrayRmse2(model, ratings)
-
     println(s"historyNum: $historyNum  currentNum: $currentNum")
     println(s"historyRate: $historyRate  currentRate: $currentRate")
+    println("userFeatures.partitioner:" + userFeatures.partitioner)
+    println("productFeatures.partitioner:" + productFeatures.partitioner)
+    /*
+    val oldTrainingRMSE = MatrixFactorizationWithSGD.computeRmseMatrixEntry(model, ratings)
     println("****************************************************************************************")
-    println(s"====Google training RMSE SGD initRMSE: $initRMSE initArrayRMSE: $initArrayRMSE initArrayRMSE2:$initArrayRMSE2================================")
+    println(s"====Google training RMSE SGD for old data in training set RMSE: $oldTrainingRMSE")
     println("****************************************************************************************")
+    */
 
-    //TODO: 看看这个rank作为参数对不对
+    println("################ Adding Init Feature Values for new users ##########################")
+    val filledUserFeatures = fillFeatures(userFeatures, ratings.keyBy(x => x.i.toInt).keys.distinct, rank)
+    println("################ Adding Init Feature Values for new productes ##########################")
+    val filledProductFeatures = fillFeatures(productFeatures, ratings.keyBy(x => x.j.toInt).keys.distinct, rank)
+/*
+    // Don't fill the features with init values
+    val filledUserFeatures = userFeatures
+    val filledProductFeatures = productFeatures
+*/
+
+    //TODO: 其实blockRatings，blockUserFeatures和blockProductFeatures本身还是需要分区，不然的话参数通信还是很大...
     //TODO: 根据blockRatings.numRowBlocks和blockRatings.numRows调整blockRatings.rowsPerBlock的大小
-    val blockRatings:BlockMatrix = new CoordinateMatrix(ratings).toBlockMatrix(rowsPerBlock, colsPerBlock).persist(intermediateRDDStorageLevel)
-    var blockUserFeatures: RDD[(Int, BrzMatrix[Double])] = new IndexedRowMatrix(userFeatures.map(x =>
-      IndexedRow(x._1.toLong, new DenseVector(x._2)))).toBlockMatrix(rowsPerBlock, rank).blocks.map {
-         case ((x, y), featureMatrix) => (x, featureMatrix.toBreeze.toDenseMatrix)
-      }.persist(intermediateRDDStorageLevel)
-    var blockProductFeatures: RDD[(Int, BrzMatrix[Double])] = new IndexedRowMatrix(productFeatures.map(x =>
-      IndexedRow(x._1.toLong, new DenseVector(x._2)))).toBlockMatrix(colsPerBlock, rank).blocks.map {
-         case ((x, y), featureMatrix) => (x, featureMatrix.toBreeze.toDenseMatrix)
-      }.persist(intermediateRDDStorageLevel)
+    val blockRatings:BlockMatrix = new CoordinateMatrix(ratings).toBlockMatrix(rowsPerBlock, colsPerBlock)
+    val blockRatingKeyByUser: RDD[(Int, ((Int, Int), Matrix))] = blockRatings.blocks.keyBy{case ((x, y), matrix) => x}
+      .partitionBy(userPartitioner).setName("blockRatingKeyByUser").persist(intermediateRDDStorageLevel)
+
+    def cutFeatureToBlocks(features: RDD[(Int, Array[Double])], numPerBlock: Int): RDD[(Int, BrzMatrix[Double])]= {
+      new IndexedRowMatrix(features.map(x =>
+        IndexedRow(x._1.toLong, new DenseVector(x._2)))).toBlockMatrix(numPerBlock, rank).blocks.map {
+        case ((x, y), featureMatrix) => (x, featureMatrix.toBreeze.toDenseMatrix)
+      }
+    }
+    var blockUserFeatures = cutFeatureToBlocks(filledUserFeatures, rowsPerBlock)
+      .partitionBy(userPartitioner).setName("blockUserFeatures").persist(intermediateRDDStorageLevel)
+    var blockProductFeatures = cutFeatureToBlocks(filledProductFeatures, colsPerBlock)
+      .partitionBy(productPartitioner).setName("blockProductFeatures").persist(intermediateRDDStorageLevel)
+
+    println("blockRatingKeyByUser.partitioner: "+blockRatingKeyByUser.partitioner)
+    println("blockUserFeatures.partitioner: "+blockUserFeatures.partitioner)
+    println("blockProductFeatures.partitioner: "+blockProductFeatures.partitioner)
+
+    /* Activate persist and checkpoint */
+    blockUserFeatures.checkpoint()
+    blockProductFeatures.checkpoint()
+    blockUserFeatures.count
+    blockProductFeatures.count
+
+    // TODO: 这里其实是对init model中缺失值进行填充后的features
     val initBlockUserFeatures = blockUserFeatures
     val initBlockProductFeatures = blockProductFeatures
 
+    val tmpZeroModel = newModel(rank, initBlockUserFeatures, initBlockProductFeatures, sofarNum,
+      rowsPerBlock, colsPerBlock, intermediateRDDStorageLevel)
+    val iterZeroRMSE = MatrixFactorizationWithSGD.computeRmseMatrixEntry(tmpZeroModel, ratings)
+    tmpZeroModel.userFeatures.unpersist()
+    tmpZeroModel.productFeatures.unpersist()
+    println("&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&Z&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&")
+    println(s"====Google training RMSE SGD in iter 0 RMSE: $iterZeroRMSE=====")
+    println("&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*")
+
+    /* Acitive blockRatings.cache() */
     println("==BlockMatrix==================")
     println("ratings.count:"+ ratings.count)
     println("blockRatings.blocks.count:" + blockRatings.blocks.count)
@@ -101,13 +240,13 @@ class MatrixFactorizationWithSGD  private[mllib] (
     println(s"stratumNum: $stratumNum")
     for (iter <- 1 to numIterations) {
       for (stratumID <- 0 until stratumNum) {
-        blockUserFeatures.persist(intermediateRDDStorageLevel)
-        blockProductFeatures.persist(intermediateRDDStorageLevel)
+        blockUserFeatures.setName("blockUserFeatures").persist(intermediateRDDStorageLevel)
+        blockProductFeatures.setName("blockProductFeatures").persist(intermediateRDDStorageLevel)
         val previousBlockUserFeatures = blockUserFeatures
         val previousBlockProductFeatures = blockProductFeatures
 
-        val newFactors = computeFactors(blockRatings, blockUserFeatures, blockProductFeatures,
-          iter, stratumID, rowsPerBlock, colsPerBlock, rank, sofarNum)
+        val newFactors = computeFactors(blockRatingKeyByUser, blockUserFeatures, blockProductFeatures,
+          iter, stratumID, stratumNum, rowsPerBlock, colsPerBlock, userPartitioner, productPartitioner, rank, sofarNum)
         blockUserFeatures = newFactors._1
         blockProductFeatures = newFactors._2
         sofarNum = newFactors._3
@@ -115,105 +254,114 @@ class MatrixFactorizationWithSGD  private[mllib] (
         previousBlockUserFeatures.unpersist()
         previousBlockProductFeatures.unpersist()
       }
+      if (sc.checkpointDir.isDefined && (iter % 3 == 0)) {
+        blockUserFeatures.checkpoint()
+        blockProductFeatures.checkpoint()
+        blockUserFeatures.count
+        blockProductFeatures.count
+      }
+      val tmpModel = newModel(rank, blockUserFeatures, blockProductFeatures, sofarNum,
+        rowsPerBlock, colsPerBlock, intermediateRDDStorageLevel)
+      val iterRMSE = MatrixFactorizationWithSGD.computeRmseMatrixEntry(tmpModel, ratings)
+      tmpModel.userFeatures.unpersist()
+      tmpModel.productFeatures.unpersist()
+      println("&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&")
+      println(s"===================Google training RMSE SGD in iter $iter RMSE: $iterRMSE====================")
+      println("&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*")
     }
 
-    val mergedBlockUserFeatures = blockUserFeatures.join(initBlockUserFeatures).map {
-      case (i, (features, oldFeatures)) =>
-        (i, historyRate * features + currentRate * oldFeatures)
+    def getMergedBlockFeatures(features: RDD[(Int, BrzMatrix[Double])], initFeatures: RDD[(Int, BrzMatrix[Double])]) = {
+      features.join(initFeatures).map {
+        case (i, (features, oldFeatures)) =>
+          (i, historyRate * features + currentRate * oldFeatures)
+      }
     }
-    val mergedBlockProductFeatures = blockProductFeatures.join(initBlockProductFeatures).map{
-      case (i, (features, oldFeatures)) =>
-        (i, historyRate * features + currentRate * oldFeatures)
-    }
+    val mergedBlockUserFeatures = getMergedBlockFeatures(blockUserFeatures, initBlockUserFeatures)
+    val mergedBlockProductFeatures = getMergedBlockFeatures(blockProductFeatures, initBlockProductFeatures)
+    mergedBlockUserFeatures.count
+    mergedBlockProductFeatures.count
 
-    def newModel(blockUserFeatures: RDD[(Int, BrzMatrix[Double])],
-                 blockProductFeatures: RDD[(Int, BrzMatrix[Double])]): MatrixFactorizationModel = {
-      val updatedUserFeatures = new BlockMatrix(blockUserFeatures.map(x => ((x._1, 0), Matrices.fromBreeze(x._2))), rowsPerBlock, rank)
-        .toIndexedRowMatrix().rows.map{
-        case IndexedRow(i, features) =>
-          (i.toInt, features.toArray)
-      }.persist(finalRDDStorageLevel)
-      val updatedProductFeatures = new BlockMatrix(blockProductFeatures.map(x => ((x._1, 0), Matrices.fromBreeze(x._2))), colsPerBlock, rank)
-        .toIndexedRowMatrix().rows.map{
-        case IndexedRow(i, features) =>
-          (i.toInt, features.toArray)
-      }.persist(finalRDDStorageLevel)
-      new MatrixFactorizationModel(rank, updatedUserFeatures, updatedProductFeatures, historyNum + currentNum)
-    }
+    blockRatingKeyByUser.unpersist()
+    initBlockUserFeatures.unpersist()
+    initBlockProductFeatures.unpersist()
 
-    val models = (newModel(blockUserFeatures, blockProductFeatures), newModel(mergedBlockUserFeatures, mergedBlockProductFeatures))
-    /*
-    blockRatings.blocks.unpersist()
-    blockUserFeatures.unpersist()
-    blockProductFeatures.unpersist()
-    */
-    models
+    (newModel(rank, blockUserFeatures, blockProductFeatures, historyNum + currentNum, rowsPerBlock, colsPerBlock, finalRDDStorageLevel),
+      newModel(rank, mergedBlockUserFeatures, mergedBlockProductFeatures, historyNum + currentNum, rowsPerBlock, colsPerBlock, finalRDDStorageLevel))
   }
 
   def computeFactors(
-                      blockRatings: BlockMatrix,
-                      blockUserFeatures: RDD[(Int, BrzMatrix[Double])],
-                      blockProductFeatures: RDD[(Int, BrzMatrix[Double])],
-                      iter: Int,
-                      stratumID: Int,
-                      rowsPerBlock: Int,
-                      colsPerBlock: Int,
-                      rank: Int,
-                      historyNum: Long,
-                      intermediateRDDStorageLevel: StorageLevel = StorageLevel.MEMORY_AND_DISK) : (RDD[(Int, BrzMatrix[Double])], RDD[(Int, BrzMatrix[Double])], Long) = {
+      blockRatingKeyByUser: RDD[(Int, ((Int, Int), Matrix))],
+      blockUserFeatures: RDD[(Int, BrzMatrix[Double])],
+      blockProductFeatures: RDD[(Int, BrzMatrix[Double])],
+      iter: Int,
+      stratumID: Int,
+      stratumNum: Int,
+      rowsPerBlock: Int,
+      colsPerBlock: Int,
+      userPartitioner: SGDPartitioner,
+      productPartitioner: SGDPartitioner,
+      rank: Int,
+      historyNum: Long,
+      intermediateRDDStorageLevel: StorageLevel = StorageLevel.MEMORY_AND_DISK) : (RDD[(Int, BrzMatrix[Double])], RDD[(Int, BrzMatrix[Double])], Long) = {
     //TODO:检验join操作是否一一对应
-    val stratumNum = math.max(blockRatings.numColBlocks, blockRatings.numRowBlocks)
     val accum = blockUserFeatures.sparkContext.accumulator(0)
-    val stratumWithFeatures = blockRatings.blocks.filter {
-      case ((x, y), matrix) =>
-        if ((x + y) % stratumNum == stratumID) true else false
-    }.map {
-      case ((x, y), matrix) => (x, ((x, y), matrix))
-    }.leftOuterJoin(blockUserFeatures).map {
-      case (k, (((x, y), matrix), userFeature)) => (y, (((x, y), matrix), userFeature))
-    }.leftOuterJoin(blockProductFeatures).persist(intermediateRDDStorageLevel)
 
     println(s"********Yeah! iter:$iter stratumID:$stratumID *********************")
-    println("blockRating blocks" + blockRatings.blocks.count)
-    println("stratumWithFeatures.count" + stratumWithFeatures.count)
 
+    /* Active cache*/
     println("********blockRatings keys********")
-    blockRatings.blocks.foreach{case ((m, n), _) => println(m, n)}
+    blockRatingKeyByUser.foreach{case (k,((m, n), _)) => println(m, n)}
     println("********blockUserFeatures keys********")
     blockUserFeatures.foreach(x=>println(x._1))
     println("********blockProductFeatures keys********")
     blockProductFeatures.foreach(x=>println(x._1))
+
+    println("blockRatingKeyByUser.partitioner: "+blockRatingKeyByUser.partitioner)
+    println("blockUserFeatures.partitioner: "+blockUserFeatures.partitioner)
+    println("blockProductFeatures.partitioner: "+blockProductFeatures.partitioner)
+
+    val stratumWithFeatures = blockRatingKeyByUser.filter {
+      case (k, ((x, y), matrix)) =>
+        if ((x + y) % stratumNum == stratumID) true else false
+    }.leftOuterJoin(blockUserFeatures).map {
+      case (k, (((x, y), matrix), userFeature)) =>
+        (y, (((x, y), matrix), userFeature))
+    }.leftOuterJoin(blockProductFeatures).map {
+      case (k, ((((x, y), matrix), userFeature), productFeature)) =>
+        (x, ((((x, y), matrix), userFeature), productFeature))
+    }.partitionBy(userPartitioner).setName("stratumWithFeatures").persist(intermediateRDDStorageLevel)
+
     println("********stratumWithFeatures keys********")
     stratumWithFeatures.foreach {
       case (k, ((((m, n), matrix), optionUserFeatureBlock), optionProductFeatureBlock)) => println(m, n)
     }
 
-    val updatedFeatures: RDD[(Int, (Boolean, BrzMatrix[Double]))] = stratumWithFeatures.flatMap {
-      case (k, ((((m, n), matrix), optionUserFeatureBlock), optionProductFeatureBlock)) =>
+    val updatedFeatures: RDD[(Int,(Int, (Boolean, BrzMatrix[Double])))] = stratumWithFeatures.flatMapValues {
+      case ((((m, n), matrix), optionUserFeatureBlock), optionProductFeatureBlock) =>
         //TODO: 处理并没有FeatureBlock或者FeatureBlock缺行
-        val userFeatureMatrixTrans:BrzMatrix[Double] = (optionUserFeatureBlock match {
-          //TODO: 要看看toBreeze以后，行列是否一致
-          case Some(featureBlock) => featureBlock
-          case None =>
-            println("==================================ERROR rand userFeature===========================================")
-            BrzMatrix.rand[Double](rowsPerBlock, rank)
-        }).t
-        val ProductFeatureMatrixTrans:BrzMatrix[Double] = (optionProductFeatureBlock match {
-          case Some(featureBlock) => featureBlock
-          case None =>
-            println("==================================ERROR rand ProductFeature===========================================")
-            BrzMatrix.rand[Double](colsPerBlock, rank)
-        }).t
+        def getFeatureMatrixTrans(optionFeatureBlock: Option[BrzMatrix[Double]], numPerBlock: Int):BrzMatrix[Double] = {
+          (optionFeatureBlock match {
+            //TODO: 要看看toBreeze以后，行列是否一致
+            case Some(featureBlock) => featureBlock
+            case None =>
+              println("====================ERROR rand initFeatureBlock=================================")
+              BrzMatrix.rand[Double](numPerBlock, rank)
+          }).t
+        }
+        val userFeatureMatrixTrans = getFeatureMatrixTrans(optionUserFeatureBlock, rowsPerBlock)
+        val ProductFeatureMatrixTrans = getFeatureMatrixTrans(optionProductFeatureBlock, colsPerBlock)
         val matrixEntrys = matrix.toBreeze.activeIterator.toArray
 
-        val beforeRMSE = MatrixFactorizationWithSGD.dataArrayRmse(userFeatureMatrixTrans, ProductFeatureMatrixTrans, matrixEntrys)
+        /*
+        val beforeRMSE = MatrixFactorizationWithSGD.localRmseZeroUnseen(userFeatureMatrixTrans, ProductFeatureMatrixTrans, matrixEntrys)
         println("*******************************************************************************")
         println(s"=======Google training RMSE before iter $iter computation: $beforeRMSE========")
         println("*******************************************************************************")
+        */
 
         println("********************************************")
         println("=======SGD UPDATE shuffled ITEMS============")
-        println("*******************************************")
+        println("********************************************")
 
         val shuffleIndices = shuffle(BrzVector.range(0, matrixEntrys.length))
         shuffleIndices.toArray.zipWithIndex.foreach { x =>
@@ -223,9 +371,10 @@ class MatrixFactorizationWithSGD  private[mllib] (
 
           // TODO: 加sqrt会使stepsize比较大，有比较大的机会把不好的局部解冲掉
           //val thisIterStepSize = stepSize / math.sqrt(historyNum + index + 1)
-          //val thisIterStepSize = stepSize / (iter*iter)
+          //val thisIterStepSize = stepSize / iter*iter
           //val thisIterStepSize = stepSize / iter
           val thisIterStepSize = stepSize / math.sqrt(iter)
+          //val thisIterStepSize = stepSize / math.pow(iter, 0.25)
 
           userFeatureMatrixTrans(::, i) :+= thisIterStepSize * (predictionError * ProductFeatureMatrixTrans(::, j) - regParam * userFeatureMatrixTrans(::, i))
           ProductFeatureMatrixTrans(::, j) :+= thisIterStepSize * (predictionError * userFeatureMatrixTrans(::, i) - regParam * ProductFeatureMatrixTrans(::, j))
@@ -235,27 +384,30 @@ class MatrixFactorizationWithSGD  private[mllib] (
           //println(s"index:$index step:$thisIterStepSize" + '\n' + s"improve:$improve")
         }
 
-        val afterRMSE = MatrixFactorizationWithSGD.dataArrayRmse(userFeatureMatrixTrans, ProductFeatureMatrixTrans, matrixEntrys)
+        /*
+        val afterRMSE = MatrixFactorizationWithSGD.localRmseZeroUnseen(userFeatureMatrixTrans, ProductFeatureMatrixTrans, matrixEntrys)
         println("****************************************************************************")
         println(s"=======Google training RMSE after iter $iter computation: $afterRMSE=======")
         println("****************************************************************************")
+        */
 
         accum += matrixEntrys.length
         List((m, (true, userFeatureMatrixTrans.t)), (n, (false, ProductFeatureMatrixTrans.t)))
-    }.persist(intermediateRDDStorageLevel)
+    }.setName("updatedFeatures").persist(intermediateRDDStorageLevel)
 
-    val updatedBlockUserFeatures = updatedFeatures.filter(_._2._1).map(x =>(x._1, x._2._2)).persist(intermediateRDDStorageLevel)
-    val updatedBlockProductFeatures = updatedFeatures.filter(!_._2._1).map(x =>(x._1, x._2._2)).persist(intermediateRDDStorageLevel)
-    println("updatedBlockUserFeatures.count:" + updatedBlockUserFeatures.count())
-    println("updatedBlockProductFeatures.count:" + updatedBlockProductFeatures.count())
+    val updatedBlockUserFeatures = updatedFeatures.filter(_._2._2._1).mapValues(x => x._2._2)
+      .setName("updatedBlockUserFeatures").persist(intermediateRDDStorageLevel)
+    val updatedBlockProductFeatures = updatedFeatures.filter(!_._2._2._1).map {case (_, x) =>(x._1, x._2._2)}
+      .partitionBy(productPartitioner).setName("updatedBlockProductFeatures").persist(intermediateRDDStorageLevel)
 
     val newBlockUserFeatures = blockUserFeatures.subtractByKey(updatedBlockUserFeatures).union(updatedBlockUserFeatures)
-      .persist(intermediateRDDStorageLevel)
+      .setName("newBlockUserFeatures").persist(intermediateRDDStorageLevel)
     val newBlockProductFeatures = blockProductFeatures.subtractByKey(updatedBlockProductFeatures).union(updatedBlockProductFeatures)
-      .persist(intermediateRDDStorageLevel)
+      .setName("newBlockProductFeatures").persist(intermediateRDDStorageLevel)
+
+    /* Activate persist of newBlockUserFeatures and newBlockProductFeatures*/
     println("newBlockUserFeatures.count:" + newBlockUserFeatures.count())
     println("newBlockProductFeatures.count:" + newBlockProductFeatures.count())
-    //println(newBlockUserFeatures.toDebugString)
 
     stratumWithFeatures.unpersist()
     updatedFeatures.unpersist()
@@ -264,11 +416,8 @@ class MatrixFactorizationWithSGD  private[mllib] (
 
     println(s"====Google accum.value:"+accum.value+"==========================")
 
-    //(blockUserFeatures,blockProductFeatures,historyNum + accum.value)
-
     (newBlockUserFeatures, newBlockProductFeatures, historyNum + accum.value)
   }
-
 }
 
 object MatrixFactorizationWithSGD {
@@ -277,20 +426,23 @@ object MatrixFactorizationWithSGD {
     else r
   }
 
+  //有mean这个action
   def computeRmse(model: MatrixFactorizationModel, data: RDD[Rating], implicitPrefs: Boolean) = {
     val predictions: RDD[Rating] = model.predict(data.map(x => (x.user, x.product)))
     val predictionsAndRatings = predictions.map { x =>
       ((x.user, x.product), mapPredictedRating(x.rating, implicitPrefs))
     }.join(data.map(x => ((x.user, x.product), x.rating))).values
-
     math.sqrt(predictionsAndRatings.map(x => (x._1 - x._2) * (x._1 - x._2)).mean())
   }
 
-  def rddRmse(model: MatrixFactorizationModel, data: RDD[MatrixEntry], implicitPrefs: Boolean = false) = {
+  def computeRmseMatrixEntry(model: MatrixFactorizationModel, data: RDD[MatrixEntry], implicitPrefs: Boolean = false) = {
     computeRmse(model, data.map{case MatrixEntry(i,j,r) => Rating(i.toInt,j.toInt,r)}, implicitPrefs)
   }
 
-  def dataArrayRmse(userFeatureMatrixTrans: BrzMatrix[Double],ProductFeatureMatrixTrans: BrzMatrix[Double], data: Array[((Int, Int), Double)]) = {
+  /*
+   * Predict the unseen data as 0
+   */
+  def localRmseZeroUnseen(userFeatureMatrixTrans: BrzMatrix[Double],ProductFeatureMatrixTrans: BrzMatrix[Double], data: Array[((Int, Int), Double)]) = {
     val rmse = data.map{
       case ((i, j), rating) =>
         val predictionError = rating - userFeatureMatrixTrans(::, i).t * ProductFeatureMatrixTrans(::, j)
@@ -299,7 +451,11 @@ object MatrixFactorizationWithSGD {
     Math.sqrt(rmse / data.length)
   }
 
-  def rddToArrayRmse(model: MatrixFactorizationModel, data: RDD[MatrixEntry]) = {
+  /*
+   * Predict the unseen data as 0, using local datas: Array[((Int, Int), Double)]
+   */
+  // TODO:这里有training data大小的collect 不应该用在分布式里头
+  def rddRmseZeroUnseen(model: MatrixFactorizationModel, data: RDD[MatrixEntry]) = {
     val userFeatures = model.userFeatures.map {
       case (i, features) => IndexedRow(i.toLong, new DenseVector(features))
     }
@@ -309,21 +465,25 @@ object MatrixFactorizationWithSGD {
     val datas = data.map{
       case MatrixEntry(i,j,k) => ((i.toInt,j.toInt),k)
     }.collect
-    dataArrayRmse(new IndexedRowMatrix(userFeatures).toBreeze.t, new IndexedRowMatrix(productFeatures).toBreeze.t, datas)
+    localRmseZeroUnseen(new IndexedRowMatrix(userFeatures).toBreeze.t, new IndexedRowMatrix(productFeatures).toBreeze.t, datas)
   }
 
-  //Jump the values not found
-  def rddToArrayRmse2(model: MatrixFactorizationModel, data: RDD[MatrixEntry]) = {
+  /*
+   * Jump the unseen data, using local userFeatures: Map[Int, Array[Double]]
+   */
+  // TODO:这里有userFeatures+productFeatures大小的collect 不应该用在分布式里头
+  def rddRmseJumpUnseen(model: MatrixFactorizationModel, data: RDD[MatrixEntry]) = {
     val userFeatures = model.userFeatures.collect.toMap
+    val productFeatures = model.productFeatures.collect.toMap
+
     println("userFeatures")
     println(userFeatures.keys.toArray.sorted)
     println("max" + userFeatures.keys.toArray.sorted.max)
     println("userFeatures.keys.size:" + userFeatures.keys.size)
-
-    val productFeatures = model.productFeatures.collect.toMap
     println("productFeatures")
     println("max" + productFeatures.keys.toArray.sorted.max)
     println("productFeatures.keys.size:" + productFeatures.keys.size)
+
     val count = data.sparkContext.accumulator(0)
     val rmse = data.flatMap{
       case MatrixEntry(i,j,rating) =>
@@ -336,4 +496,3 @@ object MatrixFactorizationWithSGD {
     Math.sqrt(rmse / count.value)
   }
 }
-

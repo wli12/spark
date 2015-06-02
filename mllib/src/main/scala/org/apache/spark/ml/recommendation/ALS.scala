@@ -637,8 +637,8 @@ object ALS extends Logging {
     println(s"numUserBlocks: $numUserBlocks")
     println(s"numItemBlocks: $numItemBlocks")
     println("==ratings===========================")
-    ratings.take(50).foreach(println)
-    println("blockRatings:" + blockRatings.count + " ratings:" + ratings.count)
+    ratings.take(10).foreach(println)
+    println("blockRatings.count:" + blockRatings.count)
     val (userInBlocks, userOutBlocks) =
       makeBlocks("user", blockRatings, userPart, itemPart, intermediateRDDStorageLevel)
     // materialize blockRatings and user blocks
@@ -717,12 +717,6 @@ object ALS extends Logging {
       itemOutBlocks.unpersist()
       blockRatings.unpersist()
     }
-    println("================================")
-    println("userInBlocks numbers:"+userInBlocks.count)
-    userInBlocks.foreach(println)
-    println("================================")
-    println("userIdAndFactors numbers:"+userIdAndFactors.count)
-    userInBlocks.foreach(println)
     (userIdAndFactors, itemIdAndFactors)
   }
 

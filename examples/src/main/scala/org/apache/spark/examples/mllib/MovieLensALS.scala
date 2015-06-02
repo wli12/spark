@@ -17,6 +17,8 @@
 
 package org.apache.spark.examples.mllib
 
+import org.apache.spark.storage.StorageLevel
+
 import scala.collection.mutable
 import org.apache.log4j.{Level, Logger}
 import scopt.OptionParser
@@ -56,8 +58,10 @@ object MovieLensALS {
     sgdStepSize: Double = 0.01,
     sgdNumIterations: Int =  5,
     sgdRegParam: Double = 1.0,
-    sgdBlockSize: Int = 1024,
-    sgdDataRate: Double = 0.75) extends AbstractParams[Params]
+    rowsPerBlock: Int = 1024,
+    colsPerBlock: Int = 1024,
+    sgdDataRate: Double = 0.75,
+    timeStamp: Boolean = false) extends AbstractParams[Params]
 
   def main(args: Array[String]) {
     val defaultParams = Params()
@@ -163,7 +167,7 @@ object MovieLensALS {
       } else {
         Rating(fields(0).toInt, fields(1).toInt, fields(2).toDouble)
       }
-    }.cache()
+    }.persist(StorageLevel.MEMORY_AND_DISK)
 
     val numRatings = ratings.count()
     val numUsers = ratings.map(_.user).distinct().count()
@@ -172,7 +176,7 @@ object MovieLensALS {
     println(s"Got $numRatings ratings from $numUsers users on $numMovies movies.")
     
     val splits = ratings.randomSplit(Array(0.8, 0.2), 1L)
-    val training = splits(0).cache()
+    val training = splits(0).persist(StorageLevel.MEMORY_AND_DISK)
     
     val test = if (params.implicitPrefs) {
       /*
@@ -185,13 +189,14 @@ object MovieLensALS {
       splits(1).map(x => Rating(x.user, x.product, if (x.rating > 0) 1.0 else 0.0))
     } else {
       splits(1)
-    }.cache()
+    }.persist(StorageLevel.MEMORY_AND_DISK)
+
 
     val numTraining = training.count()
     val numTest = test.count()
     println(s"Training: $numTraining, test: $numTest.")
 
-    ratings.unpersist(blocking = false)
+    ratings.unpersist()
 
     val bestParams = if (!params.autoParams) params else getBestParamsWithCV(training, params)
 
@@ -213,7 +218,7 @@ object MovieLensALS {
 
     val model = als.run(training)
 
-    StreamingMovieLensSGD.printModel(model, "ALS Full data model")
+    //StreamingMovieLensSGD.printModel(model, "ALS Full data model")
 
     val rmse = computeRmse(model, test, params.implicitPrefs)
 
@@ -240,13 +245,14 @@ object MovieLensALS {
 
   def getBestParamsWithCV(trainingAndValidation: RDD[Rating], params: Params): Params = {
     val splits = trainingAndValidation.randomSplit(Array(0.8, 0.2), 1L)
-    val training = splits(0).cache()
-    val validation = splits(1).cache()
+    val training = splits(0).persist(StorageLevel.MEMORY_AND_DISK)
+    val validation = splits(1).persist(StorageLevel.MEMORY_AND_DISK)
 
+    /*
     val numTraining = training.count()
     val numValidation = validation.count()
     println(s"Training: $numTraining, validation: $numValidation")
-
+    */
     val userConstraint = Constraint.withName(params.userConstraint)
     val productConstraint = Constraint.withName(params.productConstraint)
 
@@ -347,6 +353,7 @@ object MovieLensALS {
     println("productFeatures zero rate:" + itemzerorate)
   }
 
+  // 有collect，一个product大小的map，一个productFeatures大小（12gpubmed中只有116.8mb所以不怕）
   def topicsAnalysis(model: MatrixFactorizationModel, productNamesFile: String): Unit = {
     val rank = model.rank
     val productFeatures = model.productFeatures
@@ -370,7 +377,7 @@ object MovieLensALS {
       topic :ArrayBuffer[(Int, Double)] =>
         count += 1
         println("topic " + count)
-        topic.sortWith((x, y) => math.abs(x._2) > math.abs(y._2)).take(50).map {
+        topic.sortWith((x, y) => math.abs(x._2) > math.abs(y._2)).map {
           case (productID, weight) =>
             print(productNames(productID) + ":" + weight + "\t")
         }
